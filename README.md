@@ -3,7 +3,6 @@
 ## Overview
 
 
-
 ![](./SQL-o1.png)
 
 ## Introduction
