@@ -18,7 +18,7 @@ pip install -r requirements.txt
 ```
 
 ## Data Preparation (Schema-Aware Data + PSG)
-### 1.1 Please place the downloaded dataset files in the directory structure as shown below.
+### 1.1 Please place the downloaded dataset files in the directory structure as shown below.[README.md](..%2F..%2FWechat_Files%2FWeChat%20Files%2Fwxid_wfdsrq1u3sxe22%2FFileStorage%2FFile%2F2025-04%2FREADME.md)
 ```bash
 SQL-o1/
 └──dataset/
@@ -83,3 +83,20 @@ python validation_results.py --json_path ./mcts_results/bird_mcts_dev.json ( | s
 ```bash
 bash kill_llm_api.sh
 ```
+
+## BibTex
+If this work contributes to your research, please cite it as follows:
+```bash
+@misc{lyu2025sqlo1selfrewardheuristicdynamic,
+      title={SQL-o1: A Self-Reward Heuristic Dynamic Search Method for Text-to-SQL}, 
+      author={Shuai Lyu and Haoran Luo and Zhonghong Ou and Yifan Zhu and Xiaoran Shang and Yang Qin and Meina Song},
+      year={2025},
+      eprint={2502.11741},
+      archivePrefix={arXiv},
+      primaryClass={cs.DB},
+      url={https://arxiv.org/abs/2502.11741}, 
+}
+```
+For further questions, please contact: [Lxb_savior@bupt.edu.cn](Lxb_savior@bupt.edu.cn)
+## Acknowledgement
+This repository builds upon [LLM-Reasoners](https://github.com/maitrix-org/llm-reasoners) and [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). We appreciate their excellent work.
