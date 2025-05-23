@@ -7,7 +7,7 @@
 
 ## Introduction
 
-PyTorch implementation for SQL-o1: A Self-Reward Heuristic Dynamic Search Method for Text-to-SQL.
+PyTorch implementation for [SQL-o1: A Self-Reward Heuristic Dynamic Search Method for Text-to-SQL](https://arxiv.org/abs/2502.11741).
 
 ## Dependence
 ```bash
@@ -18,7 +18,7 @@ pip install -r requirements.txt
 ```
 
 ## Data Preparation (Schema-Aware Data + PSG)
-### 1.1 Please place the downloaded dataset files in the directory structure as shown below.[README.md](..%2F..%2FWechat_Files%2FWeChat%20Files%2Fwxid_wfdsrq1u3sxe22%2FFileStorage%2FFile%2F2025-04%2FREADME.md)
+### 1.1 Please place the downloaded dataset files in the directory structure as shown below.
 ```bash
 SQL-o1/
 └──dataset/
