@@ -1,4 +1,4 @@
-# SQL-o1: A Self-Reward Heuristic Dynamic Search Method for Text-to-SQL
+# SQL-o1: Automatic Text-to-SQL Program Synthesis via Self-Reward Heuristic Search
 
 ## Overview
 
@@ -7,11 +7,11 @@
 
 ## Introduction
 
-PyTorch implementation for [SQL-o1: A Self-Reward Heuristic Dynamic Search Method for Text-to-SQL](https://arxiv.org/abs/2502.11741).
+PyTorch implementation for [SQL-o1: Automatic Text-to-SQL Program Synthesis via Self-Reward Heuristic Search](https://arxiv.org/abs/2502.11741).
 
 ## Dependence
 ```bash
-conda create -n moeuie python=3.11
+conda create -n SQL-o1 python=3.11
 conda activate SQL-o1
 pip install torch==2.3.0
 pip install -r requirements.txt
@@ -47,18 +47,37 @@ SQL-o1/
                                      
 ```
 
-### 1.2 Run the script below and replace the parameters with your actual values.
+### 1.2 Build schema-aware data and mine PSG failures
 ```bash
-python preprocess_data.py --dataset spider|spider_real|spider_DK|spider_syn --mode train --LLM_model  meta-llama/Meta-Llama-3-8B-Instruct --PSG --data_path /data/vda/dataset --output_path ./dataset 
-python preprocess_data.py --dataset bird --mode train --LLM_model meta-llama/Meta-Llama-3-8B-Instruct --PSG --data_path /data/vda/dataset --output_path ./dataset 
+# Schema-aware SFT pairs
+python preprocess_data.py --dataset spider --mode train --LLM_model meta-llama/Meta-Llama-3-8B-Instruct --data_path /data/vda/dataset --output_path ./dataset
+python preprocess_data.py --dataset bird --mode train --LLM_model meta-llama/Meta-Llama-3-8B-Instruct --data_path /data/vda/dataset --output_path ./dataset
+
+# PSG failure pairs (repeat for each backbone with a unique --tag)
+python preprocess_data.py --dataset spider --mode train --PSG --tag SQL-o1_llama3 --LLM_model meta-llama/Meta-Llama-3-8B-Instruct --data_path /data/vda/dataset --output_path ./dataset
 ```
+
+Run the PSG command for each backbone with a unique `--tag`, then merge the
+schema-aware and deduplicated PSG pairs (22.7% of the final cold-start set):
+```bash
+python build_cold_start_data.py \
+  --schema_data ./dataset/SQL-o1_spider_train_0.json ./dataset/SQL-o1_bird_train_0.json \
+  --failure_data ./dataset/*_psg.json \
+  --output_file ./dataset/sql_o1_cold_start.json \
+  --psg_ratio 0.227 --max_psg_examples 4826
+```
+
 ## SFT for Model
-####  Train the model based on the data obtained from the previous step using LlamaFactory.
+Train the model using the manuscript settings (LoRA, batch size 32, learning
+rate `1e-5`, cosine decay, 2 epochs, gradient clipping at 1.0). Edit the model
+path/template when using Qwen2.5.
+
 ```bash
-FORCE_TORCHRUN=1 llamafactory-cli train examples/train_lora/llama3_lora_sft.yaml
+FORCE_TORCHRUN=1 llamafactory-cli train configs/sql_o1_lora_sft.yaml
 ```
-```bash[kill_llm_api.sh](kill_llm_api.sh)
-CUDA_VISIBLE_DEVICES=0 llamafactory-cli export  --model_name_or_path /home/huggingface/meta-llama/Llama-3-8B-Instruct --adapter_name_or_path /data/vda/saves/llama3-8b/sft/lora  --template llama3 --finetuning_type lora --use_dora --export_dir /data/vda/llama3_merge/ --export_size 2 --export_legacy_format False
+
+```bash
+CUDA_VISIBLE_DEVICES=0 llamafactory-cli export --model_name_or_path /home/huggingface/meta-llama/Llama-3-8B-Instruct --adapter_name_or_path ./saves/sql_o1/lora/sft --template llama3 --finetuning_type lora --export_dir /data/vda/llama3_merge/ --export_size 2 --export_legacy_format False
 ```
 
 ## MCTS Search for Model
@@ -66,17 +85,23 @@ CUDA_VISIBLE_DEVICES=0 llamafactory-cli export  --model_name_or_path /home/huggi
 
 ### 2.1 Prepare the test data by ensuring it is properly formatted
 ```bash
-python preprocess_data.py --dataset spider|spider_real|spider_DK|spider_syn --mode dev(test: spider_test) --LLM_model  meta-llama/Meta-Llama-3-8B-Instruct  --data_path /data/vda/dataset --output_path ./dataset 
-python preprocess_data.py --dataset bird --mode dev --LLM_model meta-llama/Meta-Llama-3-8B-Instruct  --data_path /data/vda/dataset --output_path ./dataset 
+python preprocess_data.py --dataset spider --mode dev --LLM_model meta-llama/Meta-Llama-3-8B-Instruct --data_path /data/vda/dataset --output_path ./dataset
+python preprocess_data.py --dataset bird --mode dev --LLM_model meta-llama/Meta-Llama-3-8B-Instruct --data_path /data/vda/dataset --output_path ./dataset
 ```
 ### 2.2 Start LLM API for Models
 ```bash
 CUDA_VISIBLE_DEVICES=0 API_PORT=8000 nohup python src/llm_api.py --model_name_or_path  /data/vda/llama3_merge/  --template llama3 --temperature 0.9 >> result_llm_api_0.log 2>&1 &
 ```
-### 2.3 MCTS Explore for Model (Results collection & Please replace it with your own valid parameters. )
+### 2.3 Revised MCTS search
 ```bash
-nohup python _run_explore.py --task_name bird >> result_mcts_0.txt 2>&1 &
-python validation_results.py --json_path ./mcts_results/bird_mcts_dev.json ( | spider_mcts_dev.json | spider_syn.json | spider_DK.json | spider_real.json | spider_test.json ) --db_root_path ./dataset/bird/dev/dev_databases --num_cpus 1 --diff_json_path ./dataset/bird/dev/dev.json  --output_file  spider_dev.sql (...)
+python _run_explore.py \
+  --task_name bird \
+  --dataset_root ./dataset \
+  --input_file ./dataset/SQL-o1_bird_dev_db_id_0.json \
+  --output_file ./mcts_results/bird_mcts_dev.json \
+  --pruning_transition 6
+
+python validation_results.py --json_path ./mcts_results/bird_mcts_dev.json --db_root_path ./dataset/bird/dev/dev_databases --output_file bird_dev.sql
 ```
 
 ### 2.4 Close API of Model & Test the quality of the generated .sql file.
@@ -88,7 +113,7 @@ bash kill_llm_api.sh
 If this work contributes to your research, please cite it as follows:
 ```bash
 @misc{lyu2025sqlo1selfrewardheuristicdynamic,
-      title={SQL-o1: A Self-Reward Heuristic Dynamic Search Method for Text-to-SQL}, 
+      title={SQL-o1: Automatic Text-to-SQL Program Synthesis via Self-Reward Heuristic Search},
       author={Shuai Lyu and Haoran Luo and Zhonghong Ou and Yifan Zhu and Xiaoran Shang and Yang Qin and Meina Song},
       year={2025},
       eprint={2502.11741},

@@ -42,6 +42,7 @@ class MCTSNode(Generic[State, Action, Example]):
         self.parent = parent
         self.children: 'Optional[list[MCTSNode]]' = None
         self.calc_q = calc_q
+        self.rollout_details = {}
         if parent is None:
             self.depth = 0
         else:
@@ -50,10 +51,13 @@ class MCTSNode(Generic[State, Action, Example]):
     # noinspection PyPep8Naming
     @property
     def Q(self) -> float:
-        if self.state is None:
+        if not self.cum_rewards:
             return self.fast_reward
-        else:
-            return self.calc_q(self.cum_rewards)
+        return self.calc_q(self.cum_rewards)
+
+    @property
+    def visits(self) -> int:
+        return len(self.cum_rewards)
 
 
 class MCTSResult(NamedTuple):
@@ -121,7 +125,7 @@ class MCTS(SearchAlgorithm, Generic[State, Action, Example]):
                  cum_reward: Callable[[list[float]], float] = sum,
                  calc_q: Callable[[list[float]], float] = np.mean,
                  simulate_strategy: str | Callable[[list[float]], int] = 'max',
-                 output_strategy: str = 'max_reward',
+                 output_strategy: str = 'max_value',
                  uct_with_fast_reward: bool = True,
                  aggregator: Optional[MCTSAggregation] = None,
                  disable_tqdm: bool = True,
@@ -162,7 +166,7 @@ class MCTS(SearchAlgorithm, Generic[State, Action, Example]):
         }
         self.simulate_choice: Callable[[list[float]], int] = default_simulate_strategies.get(simulate_strategy,
                                                                                              simulate_strategy)
-        assert output_strategy in ['max_reward', 'follow_max', 'max_visit', 'max_iter', 'last_iter',
+        assert output_strategy in ['max_value', 'max_reward', 'follow_max', 'max_visit', 'max_iter', 'last_iter',
                                    'last_terminal_iter']
         self.output_strategy = output_strategy
         self.uct_with_fast_reward = uct_with_fast_reward
@@ -220,29 +224,32 @@ class MCTS(SearchAlgorithm, Generic[State, Action, Example]):
             node = self._uct_select(node)
 
     def _uct(self, node: MCTSNode) -> float:
-        return node.Q + self.w_exp * np.sqrt(np.log(len(node.parent.cum_rewards)) / max(1, len(node.cum_rewards)))
+        if node.visits == 0:
+            return math.inf
+        parent_visits = max(1, node.parent.visits)
+        return node.Q + self.w_exp * np.sqrt(np.log(parent_visits) / node.visits)
 
     def _uct_select(self, node: MCTSNode) -> MCTSNode:
-        if self.uct_with_fast_reward or all(x.state is not None for x in node.children):
-            expl = [c for c in node.children if c.fast_reward_details['intuition']!=100.0] # expl = [c for c in node.children]
-            if any([len(c.cum_rewards)>0 for c in expl]):
-                # return max([c for c in node.children if c.fast_reward_details['intuition']==100.0], key=self._uct)
-                return max([c for c in node.children], key=self._uct)
-            else:
-                return max([c for c in node.children if c.fast_reward_details['intuition']==100.0 or len(c.cum_rewards)==0], key=self._uct)
-        else:
-            unvisited_children = filter(lambda x: x.state is None, node.children)
-            return max(unvisited_children, key=lambda x: x.fast_reward)
+        # Every retained action is explored once before UCT is used. Ties among
+        # unvisited nodes are resolved by the policy confidence from expansion.
+        unvisited = [child for child in node.children if child.visits == 0]
+        if unvisited:
+            return max(unvisited, key=lambda child: child.fast_reward)
+        return max(node.children, key=self._uct)
 
     def _expand(self, node: MCTSNode):
              
         if node.state is None:
-            node.state = self.world_model.step(node.parent.state, node.action)
+            step_output = self.world_model.step(node.parent.state, node.action)
+            if isinstance(step_output, tuple) and len(step_output) == 2 and isinstance(step_output[1], dict):
+                node.state, aux = step_output
+            else:
+                node.state, aux = step_output, {}
             # reward is calculated after the state is updated, so that the
             # information can be cached and passed from the world model
             # to the reward function with **aux without repetitive computation
             node.reward, node.reward_details = self.search_config. \
-                reward(node.parent.state, node.action, **node.fast_reward_details)
+                reward(node.parent.state, node.action, **node.fast_reward_details, **aux)
             node.is_terminal = self.world_model.is_terminal(node.state)
 
         if node.is_terminal:
@@ -274,6 +281,18 @@ class MCTS(SearchAlgorithm, Generic[State, Action, Example]):
             path.append(node)
 
     def _back_propagate(self, path: list[MCTSNode]):
+        process_rewards = [node.reward for node in path[1:]]
+        rollout_reward = getattr(self.search_config, 'rollout_reward', None)
+        if callable(rollout_reward):
+            # SQL-o1 computes one trajectory return G and propagates that same
+            # return through the full selected path (Eq. 8 in the manuscript).
+            cum_reward, details = rollout_reward(path, process_rewards)
+            path[-1].rollout_details = details
+            for node in path:
+                node.cum_rewards.append(cum_reward)
+            return cum_reward
+
+        # Backward-compatible behavior for other reasoner tasks.
         rewards = []
         cum_reward = -math.inf
         for node in reversed(path):
@@ -281,6 +300,24 @@ class MCTS(SearchAlgorithm, Generic[State, Action, Example]):
             cum_reward = self.cum_reward(rewards[::-1])
             node.cum_rewards.append(cum_reward)
         return cum_reward
+
+    def _path_to(self, node: MCTSNode) -> list[MCTSNode]:
+        path = []
+        while node is not None:
+            path.append(node)
+            node = node.parent
+        return list(reversed(path))
+
+    def _terminal_descendants(self, node: MCTSNode) -> list[MCTSNode]:
+        terminals = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.state is not None and current.is_terminal and current.visits:
+                terminals.append(current)
+            if current.children:
+                stack.extend(child for child in current.children if child.state is not None)
+        return terminals
 
     def _dfs_max_reward(self, path: list[MCTSNode]) -> tuple[float, list[MCTSNode]]:
         cur = path[-1]
@@ -329,6 +366,31 @@ class MCTS(SearchAlgorithm, Generic[State, Action, Example]):
                 # self.trace_in_each_iter.append(deepcopy(path))
                 self.trace_in_each_iter.append(deepcopy((cum_reward, path)))
 
+        if self.output_strategy == 'max_value':
+            visited_root_children = [
+                child for child in (self.root.children or []) if child.visits > 0
+            ]
+            if visited_root_children:
+                best_subtree = max(visited_root_children, key=lambda child: child.Q)
+                terminals = self._terminal_descendants(best_subtree)
+                if terminals:
+                    terminal = max(terminals, key=lambda child: child.Q)
+                    self._output_iter = self._path_to(terminal)
+                    self._output_cum_reward = terminal.Q
+                else:
+                    visited = []
+                    stack = [best_subtree]
+                    while stack:
+                        current = stack.pop()
+                        if current.state is not None and current.visits:
+                            visited.append(current)
+                        if current.children:
+                            stack.extend(current.children)
+                    if visited:
+                        deepest = max(visited, key=lambda child: (child.depth, child.Q))
+                        self._output_iter = self._path_to(deepest)
+                        self._output_cum_reward = deepest.Q
+
         if self.output_strategy == 'follow_max':
             self._output_iter = []
             cur = self.root
@@ -353,6 +415,12 @@ class MCTS(SearchAlgorithm, Generic[State, Action, Example]):
             if self._output_cum_reward_worst == -math.inf:
                 self._output_iter_worst = None
 
+        # Worst-path reporting is retained for compatibility with the original
+        # result schema, but is only meaningful for max_reward.
+        if self.output_strategy != 'max_reward':
+            self._output_cum_reward_worst = -math.inf
+            self._output_iter_worst = None
+
     def __call__(self,
                  world_model: WorldModel[State, Action, Example],
                  search_config: SearchConfig[State, Action, Example],
@@ -368,13 +436,13 @@ class MCTS(SearchAlgorithm, Generic[State, Action, Example]):
             terminal_state_worst = trace_worst = None
         else:
             terminal_state_worst = self._output_iter_worst[-1].state
-            trace_worst = [node.state for node in self._output_iter_worst], [node.action[0] for node in self._output_iter_worst[1:]]
+            trace_worst = [node.state for node in self._output_iter_worst], [node.action for node in self._output_iter_worst[1:]]
 
         if self._output_iter is None:
             terminal_state = trace = None
         else:
             terminal_state = self._output_iter[-1].state
-            trace = [node.state for node in self._output_iter], [node.action[0] for node in self._output_iter[1:]]
+            trace = [node.state for node in self._output_iter], [node.action for node in self._output_iter[1:]]
             
         if self.output_trace_in_each_iter:
             trace_in_each_iter = self.trace_in_each_iter

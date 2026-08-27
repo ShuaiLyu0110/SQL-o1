@@ -1,28 +1,79 @@
-from reasoners import WorldModel, LanguageModel, SearchConfig
-from typing import NamedTuple
-import sqlparse
-import requests
+"""Text-to-SQL world model and the SQL-o1 search configuration.
+
+This module implements the paper-specific parts of SQL-o1: semantic SQL
+actions, log-likelihood self rewards, confidence based dynamic pruning, and
+online execution-agreement rewards.  The generic tree traversal lives in
+``reasoners.algorithm.mcts``.
+"""
+
+from __future__ import annotations
+
+import math
+import os
 import re
+import sqlite3
+import time
+from typing import Any, NamedTuple, Sequence
+
+import requests
+
+from reasoners import LanguageModel, SearchConfig, WorldModel
+
+
 AgentAction = str
 
-CLAUSE_KEYWORDS = ['select', 'from', 'where', 'group by', 'having', 'order by', 'limit', 'intersect', 'union', 'except', 'union all']
-JOIN_KEYWORDS = ['join', 'on', 'as', 'right join', 'inner join', 'left join']
-OTHER_KEYWORDS = ['distinct']
-BIRD_KEYWORDS = ['if', 'else', 'datediff', 'over', 'instr', 'case', 'partition by', 'iif', 'float', 'real', 'when', 'int', 'using', 'timestampdiff', 'then', 'substr', 'cast', 'integer', 'strftime', 'end']
-WHERE_OPS = ['not', 'between', 'in', 'like', 'is', 'exists', 'not null', 'null']
-AGG_OPS = ['max', 'min', 'count', 'sum', 'avg']
-COND_OPS = ['and', 'or']
-ORDER_OPS = ['desc', 'asc']
-SQL_KEYWORDS = []
-SQL_KEYWORDS.extend(CLAUSE_KEYWORDS)
-SQL_KEYWORDS.extend(JOIN_KEYWORDS)
-SQL_KEYWORDS.extend(OTHER_KEYWORDS)
-SQL_KEYWORDS.extend(BIRD_KEYWORDS)
-SQL_KEYWORDS.extend(WHERE_OPS)
-SQL_KEYWORDS.extend(AGG_OPS)
-SQL_KEYWORDS.extend(COND_OPS)
-SQL_KEYWORDS.extend(ORDER_OPS)
-SQL_KEYWORDS = [i.upper() for i in SQL_KEYWORDS]
+CLAUSE_KEYWORDS = [
+    "select",
+    "from",
+    "where",
+    "group by",
+    "having",
+    "order by",
+    "limit",
+    "intersect",
+    "union all",
+    "union",
+    "except",
+]
+JOIN_KEYWORDS = ["right join", "inner join", "left join", "join", "on", "as"]
+OTHER_KEYWORDS = ["distinct"]
+BIRD_KEYWORDS = [
+    "if",
+    "else",
+    "datediff",
+    "over",
+    "instr",
+    "case",
+    "partition by",
+    "iif",
+    "float",
+    "real",
+    "when",
+    "int",
+    "using",
+    "timestampdiff",
+    "then",
+    "substr",
+    "cast",
+    "integer",
+    "strftime",
+    "end",
+]
+WHERE_OPS = ["not", "between", "in", "like", "is", "exists", "not null", "null"]
+AGG_OPS = ["max", "min", "count", "sum", "avg"]
+COND_OPS = ["and", "or"]
+ORDER_OPS = ["desc", "asc"]
+
+# Actions end at top-level semantic boundaries. Longer keywords must be tested
+# first (e.g. UNION ALL before UNION and GROUP BY before GROUP).
+ACTION_BOUNDARIES = sorted(
+    set(CLAUSE_KEYWORDS + JOIN_KEYWORDS + COND_OPS), key=len, reverse=True
+)
+_BOUNDARY_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(k) for k in ACTION_BOUNDARIES) + r")(?![A-Za-z0-9_])",
+    flags=re.IGNORECASE,
+)
+
 
 class AgentState(NamedTuple):
     step_idx: int
@@ -30,12 +81,171 @@ class AgentState(NamedTuple):
     blocks_state: str
     buffered_action: AgentAction
 
+
+def _join_sql(prefix: str, action: str) -> str:
+    prefix = prefix.strip()
+    action = action.strip()
+    if not prefix:
+        return action
+    if not action:
+        return prefix
+    if action == ";":
+        return prefix.rstrip() + ";"
+    return f"{prefix} {action}".strip()
+
+
+def _strip_model_wrapping(text: str) -> str:
+    """Extract a SQL-looking response without changing SQL literals."""
+    text = text.strip()
+    fenced = re.findall(r"```(?:sql)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        text = fenced[-1].strip()
+    # Stop after the first statement. SQL-o1 synthesizes one read-only query.
+    semicolon = text.find(";")
+    if semicolon >= 0:
+        text = text[: semicolon + 1]
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _scan_top_level_boundaries(sql: str) -> list[int]:
+    """Return keyword offsets outside quotes/comments and nested expressions."""
+    positions: list[int] = []
+    depth = 0
+    quote: str | None = None
+    i = 0
+    while i < len(sql):
+        char = sql[i]
+        if quote:
+            if char == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            i += 1
+            continue
+        if sql.startswith("--", i):
+            newline = sql.find("\n", i + 2)
+            i = len(sql) if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = len(sql) if end < 0 else end + 2
+            continue
+        if char == "(":
+            depth += 1
+            i += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0:
+            match = _BOUNDARY_RE.match(sql, i)
+            if match:
+                positions.append(i)
+                i = match.end()
+                continue
+        i += 1
+    return positions
+
+
+def segment_sql_action(completion: str) -> str:
+    """Take one syntax-aligned SQL block from a model completion."""
+    completion = completion.strip()
+    if not completion:
+        return ""
+    positions = _scan_top_level_boundaries(completion)
+    # The first keyword normally begins the current block; the second begins
+    # the next action. If a completion starts with an expression, the first
+    # keyword is the next boundary.
+    start_is_boundary = bool(positions and positions[0] == 0)
+    split_idx = positions[1] if start_is_boundary and len(positions) > 1 else None
+    if not start_is_boundary and positions:
+        split_idx = positions[0]
+    action = completion if split_idx is None else completion[:split_idx]
+    return action.strip()
+
+
+def sql_token_similarity(left: str, right: str) -> float:
+    """Jaccard similarity over SQL tokens for redundant-beam filtering."""
+    token_pattern = r"[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|<>|!=|<=|>=|[-+*/%=<>]"
+    left_tokens = set(re.findall(token_pattern, left.casefold()))
+    right_tokens = set(re.findall(token_pattern, right.casefold()))
+    if not left_tokens and not right_tokens:
+        return 1.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def _normalise_cell(value: Any) -> tuple[str, str]:
+    if value is None:
+        return ("null", "")
+    if isinstance(value, bytes):
+        return ("bytes", value.hex())
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ("float", "nan")
+        if math.isinf(value):
+            return ("float", "inf" if value > 0 else "-inf")
+        return ("float", format(value, ".15g"))
+    return (type(value).__name__, str(value))
+
+
+def execute_sql_readonly(
+    db_path: str,
+    sql: str,
+    *,
+    timeout: float = 5.0,
+    max_rows: int = 10_000,
+) -> tuple[bool, tuple[tuple[tuple[str, str], ...], ...] | None, str | None]:
+    """Execute one query safely and return a stable, hashable result.
+
+    The SQLite connection is opened in read-only/query-only mode. Results keep
+    row order (important for ORDER BY) and are capped to avoid unbounded memory
+    use during search.
+    """
+    statement = sql.strip().rstrip(";").strip()
+    if not re.match(r"^(?:select|with)\b", statement, flags=re.IGNORECASE):
+        return False, None, "only SELECT/WITH queries are allowed"
+    if not db_path or not os.path.isfile(db_path):
+        return False, None, f"database not found: {db_path}"
+
+    deadline = time.monotonic() + timeout
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{os.path.abspath(db_path)}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=timeout)
+        connection.execute("PRAGMA query_only = ON")
+
+        def timed_out() -> int:
+            return int(time.monotonic() >= deadline)
+
+        connection.set_progress_handler(timed_out, 10_000)
+        cursor = connection.execute(statement)
+        rows = cursor.fetchmany(max_rows + 1)
+        if len(rows) > max_rows:
+            rows = rows[:max_rows]
+            rows.append(("__SQL_O1_RESULT_TRUNCATED__",))
+        normalised = tuple(tuple(_normalise_cell(cell) for cell in row) for row in rows)
+        return True, normalised, None
+    except Exception as exc:  # SQLite exposes several driver-specific subclasses.
+        return False, None, str(exc)
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 class AgentWorldModel(WorldModel):
-    def __init__(self,
-                 base_model: LanguageModel,
-                 prompt: dict,
-                 max_steps: int = 4,
-                 batch_size: int = 1) -> None:
+    def __init__(
+        self,
+        base_model: LanguageModel,
+        prompt: dict,
+        max_steps: int = 4,
+        batch_size: int = 1,
+    ) -> None:
         super().__init__()
         self.max_steps = max_steps
         self.base_model = base_model
@@ -43,320 +253,248 @@ class AgentWorldModel(WorldModel):
         self.batch_size = batch_size
 
     def init_state(self) -> AgentState:
-        return AgentState(step_idx=0, 
-                          last_blocks_state="", 
-                          blocks_state="", 
-                          buffered_action="")
+        return AgentState(0, "", "", "")
 
-    def step(self, state: AgentState, action: AgentAction) -> tuple[AgentState, dict]:
-        step_idx = state.step_idx
-        # blocks_state = state.blocks_state + action + ("; " if action != "done" and action != "none" else "")
-
-        if action == ";" or action == " ;" or action.endswith(";"):
-            # blocks_state = state.blocks_state + ("" if state.blocks_state.endswith(";") or state.blocks_state.endswith("; ") else "; ") + action
-            # blocks_state = state.blocks_state + " " + action
-            blocks_state = state.blocks_state + action if not state.blocks_state else state.blocks_state + " " + action
-        else:
-            blocks_state = state.blocks_state + action if not state.blocks_state else state.blocks_state + " " + action
-
-        new_buffered_action = action
-
-        state = AgentState(step_idx=step_idx + 1,
-                        last_blocks_state=state.blocks_state,
-                        blocks_state=blocks_state,
-                        buffered_action=new_buffered_action)
-        return state
+    def step(self, state: AgentState, action: AgentAction) -> AgentState:
+        blocks_state = _join_sql(state.blocks_state, action)
+        return AgentState(
+            step_idx=state.step_idx + 1,
+            last_blocks_state=state.blocks_state,
+            blocks_state=blocks_state,
+            buffered_action=action,
+        )
 
     def is_terminal(self, state: AgentState) -> bool:
-        if state.buffered_action in [';', ' ;'] or state.buffered_action.endswith(";"):
-            return True
-        elif state.step_idx == self.max_steps:
-            return True
-        return False
-    
-    
-    
+        return state.blocks_state.rstrip().endswith(";") or state.step_idx >= self.max_steps
+
+
 class AgentConfig(SearchConfig):
-    def __init__(self,
-                 base_model: LanguageModel,
-                 prompt: dict,
-                 batch_size: int = 1,
-                 reward_alpha: float = 0.5,
-                 goal_reward_default: float = 0.,
-                 goal_reached_reward: float = 100.) -> None:
+    """Paper-specific policy/reward adapter used by generic MCTS."""
+
+    def __init__(
+        self,
+        base_model: LanguageModel,
+        prompt: dict,
+        batch_size: int = 1,
+        reward_temperature: float = 0.6,
+        base_reward: float = 100.0,
+        reward_balance: float = 0.5,
+        pruning_lambda: float = 0.9,
+        pruning_transition: int | None = None,
+        similarity_threshold: float = 0.7,
+        request_timeout: float = 120.0,
+        execution_timeout: float = 5.0,
+    ) -> None:
         super().__init__()
         self.base_model = base_model
-        self.example = None
         self.prompt = prompt
         self.batch_size = batch_size
-        self.reward_alpha = reward_alpha
-        self.goal_reward_default = goal_reward_default
-        self.goal_reached_reward = goal_reached_reward
+        self.reward_temperature = reward_temperature
+        self.base_reward = base_reward
+        self.reward_balance = reward_balance
+        self.pruning_lambda = pruning_lambda
+        self.pruning_transition = pruning_transition or max(1, prompt["depth_limit"] // 2)
+        self.similarity_threshold = similarity_threshold
+        self.request_timeout = request_timeout
+        self.execution_timeout = execution_timeout
+        self._observed_results: set[tuple[tuple[tuple[str, str], ...], ...]] = set()
+        self._session = requests.Session()
 
-    def lexical(self, query, values):
-        if isinstance(query, str):
-            for placeholder, value in values.items():
-                query = query.replace(placeholder, value)
-        elif isinstance(query, list):
-            for i in range(len(query)):
-                if query[i] in values:
-                    query[i] = values[query[i]]
-        return query
+    def update_example(self, example, prompt=None) -> None:
+        super().update_example(example, prompt=prompt)
+        self._observed_results.clear()
 
-    def delexical(self, query):
-        values = {}
-        new_query = ""
-        in_value = False
-        in_col = False
-        value = ""
-        placeholder_id = 0
-        new_query = ""
-        for char in query:
-            if char == "'":
-                in_value = not in_value
-                value += char
-                if not in_value:
-                    values[f"value_{placeholder_id}"] = value
-                    new_query += f"value_{placeholder_id}"
-                    placeholder_id += 1
-                    value = ""
-            else:
-                if not in_value:
-                    new_query += char
-                else:
-                    value += char
-        return new_query, values
+    def _prompt_with_prefix(self, prefix: str) -> str:
+        marker = "The incomplete SQL query:\n"
+        base_prompt = self.example["input"]
+        if marker in base_prompt:
+            return base_prompt.replace(marker, marker + prefix, 1)
+        return f"{base_prompt.rstrip()}\n{marker}{prefix}"
 
-    def format_query(self, q, format_type):
-        if format_type == 'unnormalized':
-            return q["query"]
-        elif format_type == 'normalized':
-            return q["gold"]["query_normalized"]
-        else:
-            raise ValueError(f"format_type {format_type} not supported")
+    def _post(self, endpoint: str, payload: dict) -> Any:
+        response = self._session.post(endpoint, json=payload, timeout=self.request_timeout)
+        response.raise_for_status()
+        return response.json()
 
-    def _is_whitespace(self, sqlparse_token):
-        return sqlparse_token.ttype == sqlparse.tokens.Whitespace
+    def _generate_candidates(self, model_input: str) -> list[str]:
+        payload = {
+            "input": model_input,
+            "output": [],
+            "beam_size": int(self.prompt["beam_size"]),
+        }
+        data = self._post(self.base_model["select"], payload)
+        if isinstance(data, dict) and "candidates" in data:
+            candidates = data["candidates"]
+            return [item["text"] if isinstance(item, dict) else str(item) for item in candidates]
+        # Compatibility with the original endpoint, which serialized a mapping
+        # of generated text to its beam score.
+        if isinstance(data, dict):
+            return list(data.keys())
+        if isinstance(data, list):
+            return [item[0] if isinstance(item, (list, tuple)) else str(item) for item in data]
+        raise TypeError(f"Unexpected generation response: {type(data).__name__}")
 
+    def _score_log_likelihoods(self, model_input: str, outputs: Sequence[str]) -> list[float]:
+        if not outputs:
+            return []
+        data = self._post(
+            self.base_model.get("reward", self.base_model["select"]),
+            {"input": model_input, "output": list(outputs)},
+        )
+        if isinstance(data, dict) and "log_likelihoods" in data:
+            return [float(value) for value in data["log_likelihoods"]]
+        if isinstance(data, list):
+            # Old servers returned beta + log p. Undo that transformation so
+            # the client remains the single owner of Eq. (4).
+            return [float(value) - self.base_reward for value in data]
+        raise TypeError(f"Unexpected scoring response: {type(data).__name__}")
 
+    def _self_rewards(self, model_input: str, outputs: Sequence[str]) -> list[float]:
+        log_likelihoods = self._score_log_likelihoods(model_input, outputs)
+        return [self.base_reward + self.reward_temperature * value for value in log_likelihoods]
 
-    def normalize_sql(self, sql_exp):
-        sql_exp = sql_exp.replace('"', "'")
-        if sql_exp.count(
-                "'") % 2 != 0:  # odd number of single quotes, meaning the value is incomplete or value contains a single quote
-            odd_quotes = True
-        else:
-            odd_quotes = False
-
-        if not odd_quotes:
-            sql_exp, values = self.delexical(sql_exp)
-            sql_exp = sql_exp.lower()
-
-        sql_exp = sql_exp.rstrip(";")
-        parse = sqlparse.parse(sql_exp)
-        sql = parse[0]
-        flat_tokens = sql.flatten()
-        sql_tokens = [
-            (token.value.upper() if token.value in SQL_KEYWORDS else token.value)
-            for token in flat_tokens if not self._is_whitespace(token)
-        ]
-
-        sql_lower = ' '.join(sql_tokens)
-        sql_lower = sql_lower.replace(' . ', '.')
-        for op in AGG_OPS:
-            sql_lower = sql_lower.replace(f" {op.upper()} (", f" {op.upper()}(")
-        sql_lower = sql_lower.replace('( ', '(')
-        sql_lower = sql_lower.replace(' )', ')')
-        sql_lower = sql_lower.replace(' ,', ',')
-
-        ### BIRD-SQL special cases ###
-        sql_lower = sql_lower.replace(' AS text', ' AS TEXT')
-        sql_lower = sql_lower.replace(' length(', ' LENGTH(')
-        sql_lower = sql_lower.replace(' total(', ' TOTAL(')
-        sql_lower = sql_lower.replace(' round(', ' ROUND(')
-        ### END ###
-
-        sql_lower = sql_lower.rstrip(";")
-        sql_lower += ';'
-
-        if not odd_quotes:
-            # sql_tokens = self.lexical(sql_tokens, values)
-            sql_lower = self.lexical(sql_lower, values)
-        # else:
-        #     print("Cannot process the following SQL")
-        #     print(sql_exp, sql_tokens)
-        return sql_lower
-
-    def segment_step(self, sql_completion):
-        try:
-            parse = sqlparse.parse(sql_completion)
-            sql = parse[0]
-        except Exception as e:
+    @staticmethod
+    def _continuation(full_or_suffix: str, prefix: str) -> str:
+        candidate = _strip_model_wrapping(full_or_suffix)
+        prefix = re.sub(r"\s+", " ", prefix).strip()
+        if not prefix:
+            return candidate
+        if candidate.casefold().startswith(prefix.casefold()):
+            return candidate[len(prefix) :].lstrip()
+        # A response beginning with SELECT/WITH is a complete query. Recover a
+        # continuation only if its normalized prefix actually matches.
+        if re.match(r"^(?:select|with)\b", candidate, flags=re.IGNORECASE):
+            prefix_tokens = prefix.split()
+            candidate_tokens = candidate.split()
+            if [t.casefold() for t in candidate_tokens[: len(prefix_tokens)]] == [
+                t.casefold() for t in prefix_tokens
+            ]:
+                return " ".join(candidate_tokens[len(prefix_tokens) :])
             return ""
-        flat_tokens = sql.flatten()
-        sql_tokens = [
-            (token.value.upper() if token.value in SQL_KEYWORDS else token.value)
-            for token in flat_tokens
-        ]
+        return candidate
 
-        step_length = 0
-        for i, token in enumerate(sql_tokens[1:]):
-            if token.lower() in CLAUSE_KEYWORDS:
-                step_length = i + 1
+    @staticmethod
+    def dynamic_threshold(scores: Sequence[float], depth: int, transition: int, scale: float) -> float:
+        if not scores:
+            return math.inf
+        if depth <= transition:
+            return scale * (sum(scores) / len(scores))
+        return max(scores)
+
+    def _prune_and_filter(self, candidates: list[tuple[str, float]], depth: int) -> list[tuple[str, float]]:
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        threshold = self.dynamic_threshold(
+            [score for _, score in candidates], depth, self.pruning_transition, self.pruning_lambda
+        )
+        retained = [(action, score) for action, score in candidates if score >= threshold]
+        # Numeric edge cases (or negative, uncalibrated legacy scores) must not
+        # erase every branch. The highest-confidence beam is always retained.
+        if not retained and candidates:
+            retained = [candidates[0]]
+
+        diverse: list[tuple[str, float]] = []
+        for candidate in retained:
+            if all(
+                sql_token_similarity(candidate[0], kept[0]) < self.similarity_threshold
+                for kept in diverse
+            ):
+                diverse.append(candidate)
+            if len(diverse) >= int(self.prompt["action_topk"]):
                 break
+        return diverse
 
-        if step_length == 0:
-            # No more clauses, the entire completion is a step
-            return sql_completion
+    def get_actions(self, state: AgentState) -> list[tuple[AgentAction, float]]:
+        model_input = self._prompt_with_prefix(state.blocks_state)
+        completions = self._generate_candidates(model_input)
+        actions: list[str] = []
+        seen: set[str] = set()
+        for completion in completions:
+            suffix = self._continuation(completion, state.blocks_state)
+            action = segment_sql_action(suffix)
+            key = re.sub(r"\s+", " ", action).strip().casefold()
+            if action and key not in seen:
+                seen.add(key)
+                actions.append(action)
+        rewards = self._self_rewards(model_input, actions)
+        return self._prune_and_filter(list(zip(actions, rewards)), state.step_idx + 1)
+
+    def fast_reward(self, state: AgentState, action: tuple[AgentAction, float]) -> tuple[float, dict]:
+        return action[1], {"intuition": action[1]}
+
+    def reward(self, state: AgentState, action: AgentAction, intuition: float | None = None) -> tuple[float, dict]:
+        # Terminal scoring belongs to rollout_reward so that Eq. (7) is applied
+        # once to the complete trajectory rather than independently per edge.
+        value = float(intuition if intuition is not None else 0.0)
+        return value, {"self_reward": value}
+
+    def rollout_reward(self, path, process_rewards: Sequence[float]) -> tuple[float, dict]:
+        """Compute Eq. (7) and update online execution-agreement memory."""
+        if not path or path[-1].state is None:
+            return -math.inf, {"error": "rollout has no terminal state"}
+        sql = path[-1].state.blocks_state.strip()
+        process_reward = sum(process_rewards) / len(process_rewards) if process_rewards else 0.0
+        terminal_reward = self._self_rewards(self._prompt_with_prefix(""), [sql])[0] if sql else 0.0
+
+        db_path = self.example.get("db_path", "")
+        succeeded, normalised_result, execution_error = execute_sql_readonly(
+            db_path, sql, timeout=self.execution_timeout
+        )
+        if not succeeded:
+            execution_reward = -1.0
+        elif normalised_result and normalised_result in self._observed_results:
+            execution_reward = 1.0
         else:
-            return "".join(sql_tokens[:step_length])
+            execution_reward = 0.0
+        if succeeded and normalised_result:
+            self._observed_results.add(normalised_result)
 
-    def get_actions(self, state: AgentState) -> list[AgentAction]:
-        if state.step_idx == self.prompt['deapth_limit']-1:
-            if self.example['target'].startswith(state.blocks_state):
-                return [('done',100.0)]
-            else:
-                return [('done',99.99)]
+        rollout_return = self.reward_balance * process_reward + (1.0 - self.reward_balance) * (
+            terminal_reward + execution_reward
+        )
+        return rollout_return, {
+            "process_reward": process_reward,
+            "terminal_reward": terminal_reward,
+            "execution_reward": execution_reward,
+            "execution_error": execution_error,
+            "sql": sql,
+        }
 
-            # if self.example['output'].startswith(state.blocks_state):
-            #     return [('done',100.0)]
-            # else:
-            #     return [('done',99.99)]
-        else:
-            # output = requests.post(self.base_model['select'], json={"instruction": self.example['instruction'], "input": self.example['instruction'] + "\n" +self.example['input']+state.blocks_state, "output": [] }).json()
-            # print(self.example['input'])
-            print(state.blocks_state)
-            print(self.example['input'].replace("The incomplete SQL query:\n", "The incomplete SQL query:\n" + state.blocks_state))
-            # input()
-            output = requests.post(self.base_model['select'], json={ "input": self.example['input'].replace("The incomplete SQL query:\n", "The incomplete SQL query:\n" + state.blocks_state), "output": [] }).json()
 
-            # def is_valid_string(s):
-            #     pattern = r'^(\[[^\]]+\]: <[^>]+>)'
-            #     if "; " not in s:
-            #         return bool(s in ['none','done'])
-            #     else:
-            #         if not s.endswith("; done"):
-            #             return False
-            #         else:
-            #             #  and x.split('<')[-1].split('>')[0] in self.example['input']
-            #             return all([bool(re.match(pattern, x)) for x in s.split("; ")[:-1]])
+from reasoners.algorithm.mcts import MCTSNode  # noqa: E402  (visualization-only imports)
+from reasoners.visualization import visualize, visualize_out, visualize_save  # noqa: E402
+from reasoners.visualization.tree_snapshot import EdgeData, NodeData  # noqa: E402
 
-            # def is_valid_string(s):
-            #     if ";" not in s:
-            #         if s == "done" or s == " done":
-            #             return s
-            #         return ""
-            #     else:
-            #         if s == "; done" or s == ";done":
-            #             return "; done"
-            #         elif s.endswith("done"):
-            #             return s.split("done")[0]
-            #         else:
-            #             return s
 
-            # sql_completions = []
-            # for key in output.keys():
-            #     key = is_valid_string(key)
-            #     if key:
-            #         if key not in ["done", " done", "; done", ";done"]:
-            #             sql_completions.append(self.normalize_sql(key))
-            #         else:
-            #             sql_completions.append(key)
-            #     else:
-            #         continue
+def blocksworld_node_data_factory(node: MCTSNode) -> NodeData:
+    return NodeData(
+        {
+            "block state": node.state.blocks_state if node.state else "Not expanded",
+            "Q": node.Q,
+            "intuition": node.fast_reward_details.get("intuition", "N/A"),
+            "# visited": len(node.cum_rewards),
+        }
+    )
 
-            def is_valid_string(s):
-                if ";" not in s:
-                    return False
-                else:
-                    return True
 
-            sql_completions = [key for key in output.keys() if is_valid_string(key)]
-            # sql_completions = [self.normalize_sql(key) for key in output.keys() if is_valid_string(key)]
+def blocksworld_edge_data_factory(node: MCTSNode) -> EdgeData:
+    return EdgeData({"action": node.action})
 
-            actions = set([
-                (
-                    self.segment_step(sql[len(state.blocks_state):].lstrip()).rstrip()
-                    if len(sql) > len(state.blocks_state)
-                    else sql
-                )
-                for sql in sql_completions
-            ])
 
-            actions = list(actions)
-
-            # p_reward = requests.post(self.base_model['select'], json={"input": self.example['instruction'] + "\n" + self.example['input']+state.blocks_state, "output": actions}).json()
-
-            p_reward = requests.post(self.base_model['select'], json={"input": self.example['input'].replace("The incomplete SQL query:\n", "The incomplete SQL query:\n" + state.blocks_state), "output": actions}).json()
-            actions_scores_list = [(a,min(r,99.99)) for a,r in zip(actions, p_reward)]
-            actions_scores_list = sorted(actions_scores_list, key=lambda x: x[1], reverse=True)[:self.prompt['step_topk']]
-            
-            # if self.example['output'].startswith(state.blocks_state):
-            #     gt_action = self.example['output'][len(state.blocks_state):]
-            #     actions_scores_list = [(gt_action, 100.0)]+[(a,r) for a,r in actions_scores_list if a!=gt_action]
-                # actions_scores_list = [(gt_action, requests.post(self.base_model['select'], json={ "input": self.example['input']+state.blocks_state, "output": [gt_action] }).json()[0])]+[(a,r) for a,r in actions_scores_list if a!=gt_action]        
-            return actions_scores_list
-
-    def fast_reward(self, state: AgentState, action: AgentAction) -> tuple[float, dict]:     
-        intuition = action[1]
-        self_eval = intuition
-
-        return (self.calculate_reward(intuition, self_eval),
-                {'intuition': intuition, "self_eval": self_eval})
-
-    def calculate_reward(self, intuition, goal_reached=None) -> float:
-        # to provide a unified interface for reward and fast_reward
-        if goal_reached is None:
-            goal_reward = self.goal_reward_default
-        elif goal_reached[0]:
-            goal_reward = goal_reached[1]
-        else:
-            goal_reward = goal_reached[1]
-        return intuition * self.reward_alpha + goal_reward * (1 - self.reward_alpha)
-
-    def reward(self, state: AgentState, action: AgentAction,
-               intuition: float = None) -> tuple[float, dict]:
-        # if action == "done" or action == "none" or action == " done":
-        if action.endswith(";"):
-            goal_reached_if = True
-            # goal_reached_score = requests.post(self.base_model['reward'], json={ "input": self.example['instruction'] + "\n" + self.example['input'], "output": [state.blocks_state+action]}).json()[0]
-            goal_reached_score = requests.post(self.base_model['reward'], json={ "input":self.example['input'], "output": [state.blocks_state+action]}).json()[0]
-
-            goal_reached = (goal_reached_if, goal_reached_score)
-        else:
-            goal_reached = (False, 0.0)
-        return (self.calculate_reward(intuition, goal_reached),
-                {'intuition': intuition, 'goal_reached': goal_reached})
-
-from reasoners.visualization import visualize,visualize_save,visualize_out
-from reasoners.visualization.tree_snapshot import NodeData, EdgeData
-from reasoners.algorithm.mcts import MCTSNode
-
-# (Optional) You can write node_data_factory and edge_data_factory to show customized information.
-def blocksworld_node_data_factory(n: MCTSNode) -> NodeData:
-    return NodeData({"block state": n.state.blocks_state if n.state else "Not expanded",
-                    #  "function state": '\n'.join(n.state.functions_state) if n.state else "Not expanded",
-                    #  "# goals satisfied": n.reward_details["goal_reached"][1] if hasattr(n, "reward_details") else "N/A",
-                     "Q": n.Q,
-                     "intuition": n.fast_reward_details["intuition"] if n.id!=0 else "N/A",
-                     "# visited": len(n.cum_rewards)})
-
-def blocksworld_edge_data_factory(n: MCTSNode) -> EdgeData:
-    return EdgeData({# "Q": n.Q,
-                    #  "intuition": n.fast_reward_details["intuition"],
-                    #  "self_eval": n.fast_reward_details["intuition"],
-                     "action": n.action})
-    
 def visualize_mcts(result_rap):
-    visualize(result_rap,
-            node_data_factory=blocksworld_node_data_factory,
-            edge_data_factory=blocksworld_edge_data_factory)   
-    
-def visualize_mcts_save(result_rap):
-    return visualize_save(result_rap,
-            node_data_factory=blocksworld_node_data_factory,
-            edge_data_factory=blocksworld_edge_data_factory)  
-    
-def visualize_mcts_out(data):
-    visualize_out(data) 
+    return visualize(
+        result_rap,
+        node_data_factory=blocksworld_node_data_factory,
+        edge_data_factory=blocksworld_edge_data_factory,
+    )
 
+
+def visualize_mcts_save(result_rap):
+    return visualize_save(
+        result_rap,
+        node_data_factory=blocksworld_node_data_factory,
+        edge_data_factory=blocksworld_edge_data_factory,
+    )
+
+
+def visualize_mcts_out(data):
+    return visualize_out(data)

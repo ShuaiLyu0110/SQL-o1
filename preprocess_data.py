@@ -13,7 +13,7 @@ from func_timeout import func_set_timeout
 import func_timeout
 import tqdm
 
-prompt_cw_temp_sft = """Given the following database schema and question, your task is to write a valid SQL query whose execution will accurately answer the question. If the value below the incomplete SQL query is not empty, your task is to complete it into a full SQL query. Remember to end the query with a semicolom ```;```.
+prompt_cw_temp_sft = """Given the following database schema and question, your task is to write a valid SQL query whose execution will accurately answer the question. If the value below the incomplete SQL query is not empty, your task is to complete it into a full SQL query. Remember to end the query with a semicolon ```;```.
 
 Database schema:
 {ds}
@@ -22,10 +22,10 @@ Sample rows of each table:
 {sr}
 
 Question:
-{qs}{hint}
+{qs}
 
 Question hint:
-{sql}
+{hint}
 
 The incomplete SQL query:
 {sql}
@@ -236,10 +236,7 @@ def get_schema_dict(db, kk=3):
         t = {}
         for j, c in enumerate(column_names):
             if c[0] == i:
-                if j in primary_keys:
-                    t[c[1]] = [column_types[j].upper(), True]
-                else:
-                    t[c[1]] = [column_types[j].upper(), True]
+                t[c[1]] = [column_types[j].upper(), j in primary_keys]
         schema_dict['tables'][table] = t
 
     for foreign_key in foreign_keys:
@@ -362,9 +359,10 @@ def parse_sql_from_string(input_string):
         except:
             None
     if 'select' in input_string.lower() and rs == '':
-        rs = input_string[input_string.find('SELECT'):]
+        select_match = re.search(r'\bselect\b', input_string, flags=re.IGNORECASE)
+        rs = input_string[select_match.start():]
     if ';' in rs:  # end
-        rs = rs[:input_string.find(';') + 1]
+        rs = rs[:rs.find(';') + 1]
     if rs == '':
         rs = 'SELECT xx FROM xx'
     return replace_multiple_spaces(rs).replace('```', '')
@@ -446,7 +444,7 @@ def execute_query_limit(db_path, query):
     cursor = conn.cursor()
     cursor = conn.cursor()
     cursor.execute(query)
-    result = cursor.fetchone()
+    result = cursor.fetchall()
     cursor.close()
     conn.close()
     return result, error
@@ -587,9 +585,16 @@ def eval_all(args):
 
             for idx, v in enumerate(response_strs):
                 pre_sql = parse_sql_from_string(response_strs[idx])
-                ex_flg3 = True if execute_query(batch_prompts[idx][6], pre_sql)[1] == '' else False
-                hard = contains_subquery(pre_sql, batch_prompts[idx][5][1]['tables'].keys())
-                if ex_flg3 == False or hard > 2:
+                predicted_result, predicted_error = execute_query(batch_prompts[idx][6], pre_sql)
+                gold_result, gold_error = execute_query(batch_prompts[idx][6], batch_prompts[idx][3])
+                # PSG mines actual failure cases. A complex but correct query is
+                # not a failure, while an executable query with the wrong result is.
+                is_failure = (
+                    predicted_error != ''
+                    or gold_error != ''
+                    or predicted_result != gold_result
+                )
+                if is_failure:
                     common_sql = 'SELECT '
                     continue_sqls.append(common_sql)
                     nc_idx.append(idx)
@@ -613,7 +618,7 @@ def eval_all(args):
                     print("%%%%%%%%%%%%%%%%%%", response_strs_[0])
                     for idx, v in enumerate(nc_idx):
                         if execute_query(batch_prompts[v][6], parse_sql_from_string(response_strs_[idx]))[
-                            0] is not None:
+                            1] == '':
                             response_strs[v] = response_strs_[idx]
 
             for j, response_str in enumerate(response_strs):
@@ -651,14 +656,16 @@ def eval_all(args):
 
                 if args.PSG:
                     if j in nc_idx:
-                        prompt = prompt_cw_temp_sft.format(ds=batch_prompts[j][0], sr=batch_prompts[j][1], qs=batch_prompts[j][2], hint=batch_prompts[j][5][2], sql=truncate_sql_before_keywords(gt_sql, CLAUSE_KEYWORDS))
+                        prompt = prompt_cw_temp_sft.format(ds=batch_prompts[j][0], sr=batch_prompts[j][1], qs=batch_prompts[j][2], hint=batch_prompts[j][5][2], sql=truncate_sql_before_keywords(gt_sql, SQL_KEYWORDS))
                         print(prompt)
                         print(f"Ground: {gt_sql}")
                         # input()
 
                         prompt_dict = {
                             "input": prompt,
-                            "target": gt_sql
+                            "target": gt_sql,
+                            "db_id": db_id,
+                            "failure_model": args.LLM_model,
                         }
 
                         prompts_collection.append(prompt_dict)
@@ -733,7 +740,7 @@ def usegpu(need_gpu_count=1):
 
 
 if __name__ == "__main__":
-    from data_process import truncate_sql_before_keywords, CLAUSE_KEYWORDS
+    from data_process import truncate_sql_before_keywords, SQL_KEYWORDS
     parser = argparse.ArgumentParser(description='SQL')
     parser.add_argument("--dataset", default='bird', type=str)
     parser.add_argument("--data_path", default='/data/vda/dataset', type=str)

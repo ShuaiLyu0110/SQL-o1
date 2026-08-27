@@ -1,7 +1,11 @@
 from typing import Generic, TypeVar, Union, NamedTuple, Protocol, Optional, runtime_checkable, Tuple
 from abc import ABC, abstractmethod
 import numpy as np
-from transformers import StoppingCriteriaList
+try:
+    from transformers import StoppingCriteriaList
+except ImportError:  # Keep search/data utilities importable without model extras.
+    class StoppingCriteriaList(list):
+        pass
 from datetime import datetime
 import os, sys, pickle
 from tqdm import tqdm

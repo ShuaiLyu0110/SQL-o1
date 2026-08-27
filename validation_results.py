@@ -4,7 +4,14 @@ import json
 import argparse
 import sqlite3
 import multiprocessing as mp
-from func_timeout import func_timeout, FunctionTimedOut
+try:
+    from func_timeout import func_timeout, FunctionTimedOut
+except ImportError:  # Exporting selected SQLs does not require timeout support.
+    class FunctionTimedOut(TimeoutError):
+        pass
+
+    def func_timeout(_timeout, function, args=()):
+        return function(*args)
 
 
 def load_json(json_path):
@@ -116,7 +123,12 @@ def extract_sql_from_backticks(pre_sql):
 
 
 def package_sqls(json_path, db_root_path):
-    """Extract SQLs and database paths from JSON, sorted by result_mcts score in descending order"""
+    """Extract the search-selected SQL without consulting the gold query.
+
+    Revised result files contain ``result_mcts_best``. Legacy files fall back
+    to their highest-scored rollout, which keeps this exporter usable for old
+    artifacts without reintroducing oracle execution selection.
+    """
     json_data = load_json(json_path)
     # print(len(json_data))
     sql_data = []
@@ -126,10 +138,13 @@ def package_sqls(json_path, db_root_path):
         db_id = item.get("db_id", "")
         target_sql = item.get("target", "")
         result_mcts = item.get("result_mcts", [])
-
-        result_mcts_sorted = sorted(result_mcts, key=lambda x: x[0], reverse=True) if result_mcts else []
-
-        predicted_sqls = [sql_pair[1] for sql_pair in result_mcts_sorted if isinstance(sql_pair, list) and len(sql_pair) == 2]
+        selected = item.get("result_mcts_best", {})
+        if isinstance(selected, dict) and selected.get("sql"):
+            predicted_sqls = [selected["sql"]]
+        else:
+            legacy = [pair for pair in result_mcts if isinstance(pair, list) and len(pair) == 2]
+            legacy.sort(key=lambda pair: pair[0], reverse=True)
+            predicted_sqls = [legacy[0][1]] if legacy else []
 
         # new_predicted_sqls = []
         # for pre_sql in predicted_sqls:
@@ -152,7 +167,7 @@ def package_sqls(json_path, db_root_path):
         #
         # predicted_sqls = new_predicted_sqls
 
-        if not predicted_sqls or not target_sql or not db_id:
+        if not predicted_sqls or not db_id:
             continue
 
         db_path = os.path.join(db_root_path, db_id, f"{db_id}.sqlite")
@@ -160,6 +175,13 @@ def package_sqls(json_path, db_root_path):
         db_paths.append(db_path)
 
     return sql_data, db_paths
+
+
+def write_selected_sqls(sql_data, output_file):
+    """Write one MCTS-selected prediction per example in dataset order."""
+    with open(output_file, 'w', encoding='utf-8') as file:
+        for predicted_sqls, _, db_id in sql_data:
+            file.write(clean_sql(predicted_sqls[0]) + '\t' + db_id + '\n')
 
 
 def run_sqls_parallel(sql_data, db_paths, output_file, num_cpus=1, meta_time_out=30.0):
@@ -192,11 +214,6 @@ if __name__ == '__main__':
 
     print(args.json_path)
 
-    with open(args.output_file, 'w', encoding='utf-8') as f:
-        f.write("")
-
     sql_data, db_paths = package_sqls(args.json_path, args.db_root_path)
-    run_sqls_parallel(sql_data, db_paths, args.output_file, num_cpus=args.num_cpus, meta_time_out=args.meta_time_out)
-    # print(exec_result)
-    exec_result = sort_results(exec_result)
-    print("The SQL file has been generated. Please test it using the test suite.")
+    write_selected_sqls(sql_data, args.output_file)
+    print(f"Generated {len(sql_data)} label-free predictions. Please test them using the benchmark suite.")

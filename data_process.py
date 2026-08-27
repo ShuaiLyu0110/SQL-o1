@@ -2,6 +2,7 @@ import os
 import io
 import json
 import random
+import re
 import numpy as np
 import torch
 import argparse
@@ -17,7 +18,7 @@ BIRD_KEYWORDS = ['if', 'else', 'datediff', 'over', 'instr', 'case', 'partition b
                  'int', 'using', 'timestampdiff', 'then', 'substr', 'cast', 'integer', 'strftime', 'end']
 WHERE_OPS = ['not', 'between', 'in', 'like', 'exists', 'not null', 'null']
 AGG_OPS = ['max', 'min', 'count', 'sum', 'avg']
-COND_OPS = ['and']
+COND_OPS = ['and', 'or']
 ORDER_OPS = ['desc', 'asc']
 SQL_KEYWORDS = []
 SQL_KEYWORDS.extend(CLAUSE_KEYWORDS)
@@ -89,6 +90,17 @@ def jload(f, mode="r"):
     return jdict
 
 
+def _syntax_boundary_positions(sql: str, keywords: list[str]) -> list[int]:
+    """Find whole-keyword boundaries case-insensitively, without duplicates."""
+    alternatives = "|".join(re.escape(keyword) for keyword in sorted(set(keywords), key=len, reverse=True))
+    matches = re.finditer(
+        rf"(?<![A-Za-z0-9_])(?:{alternatives})(?![A-Za-z0-9_])",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    return sorted({match.start() for match in matches if match.start() > 0})
+
+
 def truncate_sql_before_keywords(sql: str, keywords: list) -> str:
     """
     Truncate the SQL query randomly before one of the clause keywords (case-sensitive, for uppercase keywords).
@@ -100,22 +112,10 @@ def truncate_sql_before_keywords(sql: str, keywords: list) -> str:
     Returns:
         str: Truncated SQL query.
     """
-    # Find positions of all keywords in the SQL query
-    positions = []
-    for keyword in keywords:
-        start_idx = 0
-        while (start_idx := sql.find(keyword.upper(), start_idx)) != -1:
-            positions.append(start_idx)  # Add the position before the keyword
-            start_idx += len(keyword)
-
-    # If no keywords are found, return the original SQL
+    positions = _syntax_boundary_positions(sql, keywords)
     if not positions:
         return sql
-
-    # Randomly select a truncation point
-    truncation_point = random.choice([pos for pos in positions if pos != 0])
-
-    # Truncate the SQL at the selected point
+    truncation_point = random.choice(positions)
     return sql[:truncation_point].strip()
 
 
@@ -131,34 +131,10 @@ def truncate_sql_before_keywords_v2(sql: str, keywords: list) -> list:
     Returns:
         list: A list of all possible truncated SQL queries.
     """
-    # 对关键字按长度从短到长排序，确保长关键字不在短关键字之前截断
-    keywords = sorted(keywords, key=lambda k: len(k))
-
-    # 查找所有关键字的位置
-    positions = []
-    for keyword in keywords:
-        start_idx = 0
-        while (start_idx := sql.find(keyword, start_idx)) != -1:
-            positions.append((start_idx, keyword))  # 保存位置和关键字
-            start_idx += len(keyword)
-
-    # 如果没有找到任何关键字，返回原始 SQL 查询
+    positions = _syntax_boundary_positions(sql, keywords)
     if not positions:
         return [sql]
-
-    # 按照关键字位置排序，确保先截断离起始位置最近的关键字
-    positions.sort()
-
-    # 生成所有可能的截断后的 SQL 查询
-    truncated_sqls = []
-    for i, (pos, keyword) in enumerate(positions):
-        if pos != 0:  # 如果位置不在开头，才进行截断
-            truncated_sqls.append(sql[:pos].strip())
-
-    # 添加原始 SQL 查询到列表
-    truncated_sqls.append(sql)
-
-    return truncated_sqls
+    return [sql[:position].strip() for position in positions]
 
 
 def normal_process(list_data_dict: list[dict, ...], args):

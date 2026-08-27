@@ -1,0 +1,30 @@
+### Replace this path with the selected Llama3/Qwen2.5 checkpoint.
+model_name_or_path: meta-llama/Meta-Llama-3-8B-Instruct
+
+### SQL-o1 cold-start SFT (schema-aware + 22.7% PSG examples).
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_target: all
+dataset: sql_o1_cold_start
+dataset_dir: ./dataset
+template: llama3
+cutoff_len: 4096
+overwrite_cache: true
+preprocessing_num_workers: 16
+
+### One process per GPU. With 8 GPUs this is a global batch size of 32.
+output_dir: ./saves/sql_o1/lora/sft
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5
+num_train_epochs: 2.0
+lr_scheduler_type: cosine
+max_grad_norm: 1.0
+bf16: true
+ddp_timeout: 180000000
+
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true

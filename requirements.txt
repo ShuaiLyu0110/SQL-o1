@@ -36,3 +36,7 @@ openai==1.55.1
 mixture-of-depth==1.1.6
 openpyxl==3.1.5
 scikit-learn==1.5.2
+requests==2.32.3
+sqlparse==0.5.3
+func-timeout==4.3.5
+pynvml==11.5.3
